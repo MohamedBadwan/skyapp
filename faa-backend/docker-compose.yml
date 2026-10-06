@@ -1,0 +1,30 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo_data:/data/db
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      MONGODB_URI: mongodb://mongo:27017/faa_exam
+      JWT_SECRET: cambia-esto-en-produccion
+      JWT_EXPIRES_IN: 7d
+      CORS_ORIGIN: '*'
+      ADMIN_EMAIL: admin@jjaeronautic.com
+      ADMIN_PASSWORD: Cambia_Esta_Clave_123
+    ports:
+      - '4000:4000'
+    # Ejecuta el seed una vez y luego arranca la API:
+    command: sh -c "node dist/seed/seed.js && node dist/server.js"
+
+volumes:
+  mongo_data:

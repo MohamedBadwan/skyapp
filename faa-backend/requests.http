@@ -1,0 +1,71 @@
+### FAA A&P Exam Backend — pruebas rápidas (VS Code REST Client / IntelliJ HTTP)
+@base = http://localhost:4000/api
+@token = PEGA_AQUI_EL_TOKEN
+
+### Health
+GET {{base}}/health
+
+### Registrar alumno
+POST {{base}}/auth/register
+Content-Type: application/json
+
+{ "name": "Alumno Demo", "email": "alumno@demo.com", "password": "clave12345" }
+
+### Login (copia el token de la respuesta a @token)
+POST {{base}}/auth/login
+Content-Type: application/json
+
+{ "email": "alumno@demo.com", "password": "clave12345" }
+
+### Solicitar código de restablecimiento
+POST {{base}}/auth/password-reset/request
+Content-Type: application/json
+
+{ "email": "alumno@demo.com" }
+
+### Verificar el código (copia resetToken de la respuesta)
+POST {{base}}/auth/password-reset/verify
+Content-Type: application/json
+
+{ "email": "alumno@demo.com", "code": "123456" }
+
+### Restablecer contraseña (pega el resetToken tras verificar el código)
+POST {{base}}/auth/password-reset/confirm
+Content-Type: application/json
+
+{ "resetToken": "PEGA_EL_RESET_TOKEN_AQUI", "password": "nueva-clave-123" }
+
+### Mi perfil
+GET {{base}}/auth/me
+Authorization: Bearer {{token}}
+
+### Materias por rating
+GET {{base}}/questions/subjects?rating=AMP
+Authorization: Bearer {{token}}
+
+### Preguntas escritas por materia (aleatorias)
+GET {{base}}/questions/written?rating=AMP&subject=Turbine Engines&limit=20&random=true
+Authorization: Bearer {{token}}
+
+### Preguntas con figura
+GET {{base}}/questions/figures?rating=AMG
+Authorization: Bearer {{token}}
+
+### Banco oral
+GET {{base}}/questions/oral?rating=AMP&subject=Propellers
+Authorization: Bearer {{token}}
+
+### Generar examen escrito oficial (AMP = 100 preguntas)
+GET {{base}}/exam/written/AMP
+Authorization: Bearer {{token}}
+
+### Guardar progreso de una sesión de estudio
+POST {{base}}/progress
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "rating": "AMP", "subject": "Turbine Engines", "correct": 17, "attempted": 20 }
+
+### Ver mi progreso
+GET {{base}}/progress
+Authorization: Bearer {{token}}
