@@ -23,9 +23,21 @@ export function createApp(): Application {
   );
   app.use(compression());
 
+  // A Vercel function can be started without running server.ts. Connect here so
+  // both the local server and Vercel's default Express export use MongoDB.
+  const ensureDB: express.RequestHandler = async (_req, _res, next) => {
+    try {
+      await connectDB();
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+
   // Stripe webhook needs the raw body for signature verification.
-  // Must be mounted BEFORE express.json().
-  app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), handleWebhook);
+  // Must be mounted BEFORE express.json(). Stripe often hits a cold instance,
+  // so it needs its own DB connection.
+  app.post('/api/billing/webhook', ensureDB, express.raw({ type: 'application/json' }), handleWebhook);
 
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true }));
@@ -43,16 +55,7 @@ export function createApp(): Application {
     next();
   });
 
-  // A Vercel function can be started without running server.ts. Connect here so
-  // both the local server and Vercel's default Express export use MongoDB.
-  app.use(async (_req, _res, next) => {
-    try {
-      await connectDB();
-      next();
-    } catch (error) {
-      next(error);
-    }
-  });
+  app.use(ensureDB);
 
   // Rate limit global (protege login/registro de fuerza bruta).
   app.use(

@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
-import { User } from '../models/User';
+import { Types } from 'mongoose';
+import { IUser, SubscriptionStatus, User } from '../models/User';
 import { ApiError } from '../utils/ApiError';
 import { asyncHandler } from '../utils/asyncHandler';
 import { env } from '../config/env';
@@ -10,6 +11,7 @@ import { hasActiveManualAccess, hasActiveStripeSubscription } from '../services/
 
 export function buildSubscriptionCheckoutParams(
   lineItem: Stripe.Checkout.SessionCreateParams.LineItem,
+  userId?: string,
 ): Stripe.Checkout.SessionCreateParams {
   return {
     mode: 'subscription',
@@ -17,7 +19,71 @@ export function buildSubscriptionCheckoutParams(
     allow_promotion_codes: true,
     success_url: env.stripe.successUrl,
     cancel_url: env.stripe.cancelUrl,
+    ...(userId && {
+      client_reference_id: userId,
+      metadata: { userId },
+      subscription_data: { metadata: { userId } },
+    }),
   };
+}
+
+const LIVE_STRIPE_STATUSES: Stripe.Subscription.Status[] = ['active', 'trialing', 'past_due', 'unpaid'];
+
+function mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus {
+  if (status === 'trialing') return 'active';
+  return (['active', 'past_due', 'canceled', 'unpaid'] as const).includes(
+    status as 'active' | 'past_due' | 'canceled' | 'unpaid',
+  )
+    ? (status as SubscriptionStatus)
+    : 'none';
+}
+
+function stripeId(value: string | { id: string } | null | undefined): string | undefined {
+  if (!value) return undefined;
+  return typeof value === 'string' ? value : value.id;
+}
+
+/**
+ * Returns the user's Stripe customer, reusing one that already exists for the
+ * email so a second checkout never creates a duplicate customer.
+ */
+async function ensureStripeCustomer(user: IUser): Promise<string> {
+  if (user.stripeCustomerId) return user.stripeCustomerId;
+
+  const existing = await stripe.customers.list({ email: user.email, limit: 10 });
+  let customerId: string | undefined;
+  for (const customer of existing.data) {
+    const subs = await stripe.subscriptions.list({ customer: customer.id, status: 'all', limit: 10 });
+    if (subs.data.some((s) => LIVE_STRIPE_STATUSES.includes(s.status))) {
+      customerId = customer.id;
+      break;
+    }
+  }
+  customerId ??= existing.data[0]?.id;
+  customerId ??= (
+    await stripe.customers.create({
+      email: user.email,
+      name: user.name,
+      metadata: { userId: user._id.toString() },
+    })
+  ).id;
+
+  user.stripeCustomerId = customerId;
+  await user.save();
+  return customerId;
+}
+
+async function findLiveSubscription(customerId: string): Promise<Stripe.Subscription | undefined> {
+  const subs = await stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 10 });
+  return subs.data.find((s) => LIVE_STRIPE_STATUSES.includes(s.status));
+}
+
+function applySubscription(user: IUser, subscription: Stripe.Subscription) {
+  user.stripeCustomerId = stripeId(subscription.customer);
+  user.subscriptionId = subscription.id;
+  user.subscriptionStatus = mapStripeStatus(subscription.status);
+  user.currentPeriodEnd = getSubscriptionPeriodEnd(subscription);
+  user.cancelAtPeriodEnd = subscription.cancel_at_period_end;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -68,14 +134,19 @@ export const createCheckout = asyncHandler(async (req: Request, res: Response) =
         quantity: 1,
       };
 
-  const sessionParams = buildSubscriptionCheckoutParams(lineItem);
+  const customerId = await ensureStripeCustomer(user);
 
-  if (user.stripeCustomerId) {
-    sessionParams.customer = user.stripeCustomerId;
-  } else {
-    sessionParams.customer_email = user.email;
-    sessionParams.metadata = { userId: user._id.toString() };
+  // The database can lag behind Stripe if a webhook was lost; trust Stripe so
+  // the user is never charged for a second subscription.
+  const liveSubscription = await findLiveSubscription(customerId);
+  if (liveSubscription) {
+    applySubscription(user, liveSubscription);
+    await user.save();
+    throw ApiError.badRequest('Ya tienes una suscripción activa.');
   }
+
+  const sessionParams = buildSubscriptionCheckoutParams(lineItem, user._id.toString());
+  sessionParams.customer = customerId;
 
   const session = await stripe.checkout.sessions.create(sessionParams);
   res.json({ ok: true, url: session.url });
@@ -173,7 +244,10 @@ export const handleWebhook = async (req: Request, res: Response) => {
         break;
     }
   } catch (err) {
-    console.error(`⚠️  Error processing webhook ${event.type}:`, err);
+    console.error(`⚠️  Error processing webhook ${event.type} (${event.id}):`, err);
+    // A non-2xx response makes Stripe retry the delivery.
+    res.status(500).json({ error: 'Error procesando el webhook.' });
+    return;
   }
 
   res.json({ received: true });
@@ -183,30 +257,65 @@ export const handleWebhook = async (req: Request, res: Response) => {
 // Webhook event handlers
 // ────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Resolves the app user for a Stripe object. Falls back to the userId metadata
+ * and the customer's email so a customer that was never linked (e.g. a lost
+ * webhook) still reaches the right account.
+ */
+async function findUserForStripe(
+  customerId: string | undefined,
+  userId?: string | null,
+  email?: string | null,
+): Promise<IUser | null> {
+  if (customerId) {
+    const user = await User.findOne({ stripeCustomerId: customerId });
+    if (user) return user;
+  }
+  if (userId && Types.ObjectId.isValid(userId)) {
+    const user = await User.findById(userId);
+    if (user) return user;
+  }
+  if (!email && customerId) {
+    const customer = await stripe.customers.retrieve(customerId);
+    if (!customer.deleted) email = customer.email;
+  }
+  return email ? User.findOne({ email: email.toLowerCase() }) : null;
+}
+
+/**
+ * False when the event belongs to a different subscription than the one that
+ * currently grants the user access (a duplicate), so it must not overwrite it.
+ */
+export function tracksSubscription(
+  user: Pick<IUser, 'subscriptionId' | 'subscriptionStatus' | 'currentPeriodEnd' | 'manualAccessEndsAt'>,
+  subscriptionId: string,
+): boolean {
+  return !user.subscriptionId
+    || user.subscriptionId === subscriptionId
+    || !hasActiveStripeSubscription(user);
+}
+
+function invoiceSubscriptionId(invoice: Stripe.Invoice): string | undefined {
+  return stripeId(invoice.parent?.subscription_details?.subscription);
+}
+
 async function onCheckoutCompleted(session: Stripe.Checkout.Session) {
-  const customerId = session.customer as string;
-  const subscriptionId = session.subscription as string;
+  const customerId = stripeId(session.customer);
+  const subscriptionId = stripeId(session.subscription);
+  if (!subscriptionId) return;
 
   const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-  let user = await User.findOne({ stripeCustomerId: customerId });
-  if (!user) {
-    const email = session.customer_details?.email ?? session.customer_email;
-    if (email) user = await User.findOne({ email });
-  }
-  if (!user && session.metadata?.userId) {
-    user = await User.findById(session.metadata.userId);
-  }
+  const user = await findUserForStripe(
+    customerId,
+    session.client_reference_id ?? session.metadata?.userId,
+    session.customer_details?.email ?? session.customer_email,
+  );
   if (!user) {
     console.error('⚠️  checkout.session.completed: user not found', { customerId, session: session.id });
     return;
   }
 
-  user.stripeCustomerId = customerId;
-  user.subscriptionId = subscriptionId;
-  user.subscriptionStatus = 'active';
-  user.currentPeriodEnd = getSubscriptionPeriodEnd(subscription);
-  user.cancelAtPeriodEnd = false;
+  applySubscription(user, subscription);
   await user.save();
   await recordSubscriptionEvent({
     user: user._id,
@@ -218,21 +327,16 @@ async function onCheckoutCompleted(session: Stripe.Checkout.Session) {
 }
 
 async function onSubscriptionUpdated(subscription: Stripe.Subscription) {
-  const user = await User.findOne({ stripeCustomerId: subscription.customer as string });
+  const user = await findUserForStripe(stripeId(subscription.customer), subscription.metadata?.userId);
   if (!user) return;
-
-  const stripeStatus = subscription.status;
-  const mapped = (['active', 'past_due', 'canceled', 'unpaid'] as const).includes(
-    stripeStatus as 'active' | 'past_due' | 'canceled' | 'unpaid',
-  )
-    ? (stripeStatus as 'active' | 'past_due' | 'canceled' | 'unpaid')
-    : 'none';
+  if (!tracksSubscription(user, subscription.id)) {
+    console.warn('⚠️  customer.subscription.updated: ignoring duplicate subscription', subscription.id);
+    return;
+  }
 
   const previousStatus = user.subscriptionStatus;
   const wasScheduledToCancel = user.cancelAtPeriodEnd ?? false;
-  user.subscriptionStatus = mapped;
-  user.currentPeriodEnd = getSubscriptionPeriodEnd(subscription);
-  user.cancelAtPeriodEnd = subscription.cancel_at_period_end;
+  applySubscription(user, subscription);
   await user.save();
 
   if (!wasScheduledToCancel && user.cancelAtPeriodEnd) {
@@ -265,8 +369,12 @@ async function onSubscriptionUpdated(subscription: Stripe.Subscription) {
 }
 
 async function onSubscriptionDeleted(subscription: Stripe.Subscription) {
-  const user = await User.findOne({ stripeCustomerId: subscription.customer as string });
+  const user = await findUserForStripe(stripeId(subscription.customer), subscription.metadata?.userId);
   if (!user) return;
+  if (user.subscriptionId && user.subscriptionId !== subscription.id) {
+    console.warn('⚠️  customer.subscription.deleted: ignoring duplicate subscription', subscription.id);
+    return;
+  }
 
   user.subscriptionStatus = 'canceled';
   user.subscriptionId = undefined;
@@ -282,14 +390,18 @@ async function onSubscriptionDeleted(subscription: Stripe.Subscription) {
 }
 
 async function onPaymentFailed(invoice: Stripe.Invoice) {
-  const customerId = invoice.customer as string;
+  const customerId = stripeId(invoice.customer);
   if (!customerId) return;
-  const user = await User.findOneAndUpdate(
-    { stripeCustomerId: customerId },
-    { subscriptionStatus: 'past_due' },
-    { new: true },
-  );
+  const subscriptionId = invoiceSubscriptionId(invoice);
+  const user = await findUserForStripe(customerId, invoice.parent?.subscription_details?.metadata?.userId);
   if (!user) return;
+  if (subscriptionId && !tracksSubscription(user, subscriptionId)) {
+    console.warn('⚠️  invoice.payment_failed: ignoring duplicate subscription', subscriptionId);
+    return;
+  }
+
+  user.subscriptionStatus = 'past_due';
+  await user.save();
   await recordSubscriptionEvent({
     user: user._id,
     subscriptionId: user.subscriptionId,
@@ -301,21 +413,23 @@ async function onPaymentFailed(invoice: Stripe.Invoice) {
 }
 
 async function onPaymentSucceeded(invoice: Stripe.Invoice) {
-  const customerId = invoice.customer as string;
-  const subDetails = invoice.parent?.subscription_details;
-  const subscriptionId =
-    typeof subDetails?.subscription === 'string'
-      ? subDetails.subscription
-      : subDetails?.subscription?.id;
+  const customerId = stripeId(invoice.customer);
+  const subscriptionId = invoiceSubscriptionId(invoice);
   if (!customerId || !subscriptionId) return;
 
   const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-  const user = await User.findOneAndUpdate(
-    { stripeCustomerId: customerId },
-    { currentPeriodEnd: getSubscriptionPeriodEnd(subscription) },
-    { new: true },
-  );
-  if (!user) return;
+  const user = await findUserForStripe(customerId, subscription.metadata?.userId);
+  if (!user) {
+    console.error('⚠️  invoice.payment_succeeded: user not found', { customerId, invoice: invoice.id });
+    return;
+  }
+  if (!tracksSubscription(user, subscriptionId)) {
+    console.warn('⚠️  invoice.payment_succeeded: ignoring duplicate subscription', subscriptionId);
+    return;
+  }
+
+  applySubscription(user, subscription);
+  await user.save();
   const paidAt = invoice.status_transitions?.paid_at
     ? new Date(invoice.status_transitions.paid_at * 1000)
     : new Date();

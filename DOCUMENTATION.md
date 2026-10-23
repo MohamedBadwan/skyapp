@@ -77,3 +77,14 @@ Uses `localStorage` with key pattern `practice-{rating}-{modeType}` to save:
 ## Billing
 
 Stripe subscription with checkout sessions. Protected routes require active subscription via the `Protected` component with `requireSubscription` prop.
+
+Access is granted while `subscriptionStatus` is `active` and `currentPeriodEnd` is in the future (or while `manualAccessEndsAt` is in the future). Both are kept in sync by the webhook at `POST /api/billing/webhook`.
+
+Safeguards against duplicate charges and lost webhooks:
+
+- **Checkout** (`POST /api/billing/checkout`) always uses a single Stripe customer per user: it reuses `stripeCustomerId`, otherwise an existing Stripe customer with the same email, otherwise creates one and stores it before redirecting. If that customer already has a live subscription in Stripe, the user record is synced from Stripe and checkout is refused.
+- Every Checkout session carries the app user id (`client_reference_id`, `metadata.userId` and `subscription_data.metadata.userId`).
+- **Webhook user lookup** tries `stripeCustomerId`, then `metadata.userId`, then the Stripe customer's email.
+- Events for a subscription other than the one currently granting access are ignored (duplicates); once the linked subscription no longer grants access, a paid subscription on the same user takes over.
+- If processing fails the webhook responds `500`, so Stripe retries the delivery.
+- The webhook route connects to MongoDB itself (`ensureDB` in `src/app.ts`). It is mounted before the global middleware because it needs the raw body, and Stripe usually reaches a cold Vercel instance with no open connection.
